@@ -120,12 +120,15 @@ enum ErrorHandlingMode {
   NoHandling = 0,
   TearDown = 1,
   CleanUpOnly = 2,
-  SkipCleanUp = 3
+  SkipCleanUp = 3,
+  CleanUpAndRaiseException = 4,
 };
 
 #define SHOULD_CLEAN_UP(a) (a != NoHandling && a != SkipCleanUp)
 
-#define SHOULD_TEAR_DOWN(a) (a != NoHandling && a != CleanUpOnly)
+#define SHOULD_TEAR_DOWN(a) (a != NoHandling && a != CleanUpOnly && a != CleanUpAndRaiseException)
+
+#define SHOULD_RAISE_PYTHON_EXCEPTION(a) (a == CleanUpAndRaiseException)
 
 #define PRINT_COLLECTIVE_HASH_SIGNATURE(phase, opType, numel, hashValue)      \
   LOG(WARNING) << logPrefix() << "Hash of " << phase << " to NCCL " << opType \

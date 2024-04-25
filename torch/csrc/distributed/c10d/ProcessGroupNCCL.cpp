@@ -1,5 +1,6 @@
 
 #ifdef USE_C10D_NCCL
+#include <Python.h>
 
 #include <exception>
 #include <fstream>
@@ -572,6 +573,14 @@ bool ProcessGroupNCCL::WorkNCCL::checkTimeout(
   return true;
 }
 
+static PyObject *
+raisePythonException(const char* errorMsg) {
+  Py_Initialize();
+  PyErr_SetString(PyExc_RuntimeError, errorMsg);
+  Py_Finalize();
+  return NULL;
+}
+
 void ProcessGroupNCCL::WorkNCCL::handleException(
     ErrorHandlingMode errorHandling) {
   if (exception_) {
@@ -587,6 +596,9 @@ void ProcessGroupNCCL::WorkNCCL::handleException(
           "To avoid data inconsistency, we are taking the entire process down.");
       LOG(ERROR) << logPrefix() << tearDownMsg;
       std::rethrow_exception(exception_);
+    }
+    if (SHOULD_RAISE_PYTHON_EXCEPTION(errorHandling)) {
+      raisePythonException(getExceptionMsgFromExceptionPtr(exception_).c_str());
     }
   }
 }
