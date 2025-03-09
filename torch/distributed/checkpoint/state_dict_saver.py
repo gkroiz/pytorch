@@ -3,23 +3,12 @@
 import inspect
 import os
 import warnings
-from concurrent.futures import Future
-from enum import Enum
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import cast, Optional, Union
-from typing_extensions import deprecated
 
 import torch
 import torch.distributed as dist
 from torch.distributed._state_dict_utils import _copy_state_dict, _create_cpu_state_dict
-from torch.distributed.checkpoint._async_executor import (  # noqa: TC001
-    _AsyncCheckpointExecutor,
-)
-from torch.distributed.checkpoint._async_process_executor import (
-    _ProcessBasedAsyncCheckpointExecutor,
-)
-from torch.distributed.checkpoint._async_thread_executor import (
-    _ThreadBasedAsyncCheckpointExecutor,
-)
 from torch.distributed.checkpoint._storage_utils import _storage_setup
 from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
 from torch.distributed.checkpoint.logger import _dcp_method_logger
@@ -27,20 +16,15 @@ from torch.distributed.checkpoint.metadata import Metadata, STATE_DICT_TYPE
 from torch.distributed.checkpoint.planner import SavePlan, SavePlanner
 from torch.distributed.checkpoint.staging import AsyncStager
 from torch.distributed.checkpoint.stateful import Stateful
-from torch.distributed.checkpoint.storage import StorageWriter
+from torch.distributed.checkpoint.storage import StorageWriter, WriteResult
+from torch.distributed.checkpoint.utils import DistributedCheckpointingType, _get_distributed_checkpointing_type
 from torch.distributed.distributed_c10d import _get_default_group
+from typing_extensions import deprecated
 
 from .utils import _api_bc_check, _DistWrapper, _profile
 
 
-__all__ = ["save_state_dict", "save", "async_save", "AsyncCheckpointerType"]
-
-
-class AsyncCheckpointerType(Enum):
-    """Enum for async checkpointer type."""
-
-    THREAD = "thread"
-    PROCESS = "process"
+__all__ = ["save_state_dict", "save", "async_save"]
 
 
 @deprecated(
@@ -144,9 +128,7 @@ def save(
 
         >>> state_dict = {"model": my_model}
 
-        >>> fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(
-        ...     "/checkpoint/1"
-        ... )
+        >>> fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter("/checkpoint/1")
         >>> torch.distributed.checkpoint.save(
         >>>     state_dict=state_dict,
         >>>     storage_writer=fs_storage_writer,
@@ -160,19 +142,13 @@ def save(
         and it is the user's responsibility to ensure that this is set so that
         each rank has an individual GPU, via ``torch.cuda.set_device()``.
     """
-    torch._C._log_api_usage_once("torch.distributed.checkpoint.save")
-
-    no_dist = no_dist or (not dist.is_available()) or (not dist.is_initialized())
-    if no_dist:
-        warnings.warn(
-            "torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process."
-        )
+    torch._C._log_api_usage_once("torch.distributed.checkpoint.save")        
 
     with _profile():
         storage_writer = cast(
             StorageWriter, _storage_setup(storage_writer, checkpoint_id, reader=False)
         )
-
+    
         return _save_state_dict(
             state_dict=_stateful_to_state_dict(state_dict),
             storage_writer=storage_writer,
@@ -190,7 +166,6 @@ def async_save(
     storage_writer: Optional[StorageWriter] = None,
     planner: Optional[SavePlanner] = None,
     process_group: Optional[dist.ProcessGroup] = None,
-    async_checkpointer_type: AsyncCheckpointerType = AsyncCheckpointerType.THREAD,
 ) -> Future:
     """Asynchronous version of ``save``. This code first de-stages the state_dict on to the
     staging storage (defaults to CPU memory), and then calls the `save` in a separate thread.
@@ -226,9 +201,7 @@ def async_save(
 
         >>> state_dict = {"model": my_model}
 
-        >>> fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(
-        ...     "/checkpoint/1"
-        ... )
+        >>> fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter("/checkpoint/1")
         >>> checkpoint_future = torch.distributed.checkpoint.async_save(
         >>>     state_dict=state_dict,
         >>>     storage_writer=fs_storage_writer,
@@ -245,9 +218,7 @@ def async_save(
         pg = process_group or _get_default_group()
         assert (
             torch.device("cpu") in pg._device_types  # type: ignore[attr-defined]
-        ), (
-            "A CPU backend must be enabled for async save; try initializing process group with 'cpu:gloo,cuda:nccl'"
-        )
+        ), "A CPU backend must be enabled for async save; try initializing process group with 'cpu:gloo,cuda:nccl'"
 
     storage_writer = cast(
         StorageWriter, _storage_setup(storage_writer, checkpoint_id, reader=False)
@@ -260,19 +231,16 @@ def async_save(
         staged_state_dict = _create_cpu_state_dict(state_dict)
         _copy_state_dict(state_dict, staged_state_dict, type_check=False)
 
-    executor: _AsyncCheckpointExecutor = (
-        _ProcessBasedAsyncCheckpointExecutor()
-        if async_checkpointer_type == AsyncCheckpointerType.PROCESS
-        else _ThreadBasedAsyncCheckpointExecutor()
-    )
-
-    f: Future = executor.execute_save(
+    executor = ThreadPoolExecutor(max_workers=1)
+    f: Future = executor.submit(
+        save,
         staged_state_dict,
         checkpoint_id=checkpoint_id,
         storage_writer=storage_writer,
         planner=planner,
         process_group=process_group,
     )
+    f.add_done_callback(lambda f: executor.shutdown(wait=False))
 
     if (
         isinstance(storage_writer, AsyncStager)
@@ -292,7 +260,6 @@ def _stateful_to_state_dict(state_dict: STATE_DICT_TYPE) -> STATE_DICT_TYPE:
         )
     return stateful_state_dict
 
-
 def _save_state_dict(
     state_dict: STATE_DICT_TYPE,
     storage_writer: StorageWriter,
@@ -303,7 +270,12 @@ def _save_state_dict(
 ) -> Metadata:
     torch._C._log_api_usage_once("torch.distributed.checkpoint.save_state_dict")
 
-    distW = _DistWrapper(process_group, not no_dist, coordinator_rank)
+    distributed_checkpointing_type = _get_distributed_checkpointing_type(no_dist)
+    use_dist = distributed_checkpointing_type == DistributedCheckpointingType.DISTRIBUTED_CHECKPOINTING
+    use_rank_coordination = not (distributed_checkpointing_type == DistributedCheckpointingType.NO_COORDINATION_CHECKPOINTING)
+
+    distW = _DistWrapper(process_group, use_dist, coordinator_rank)
+
     if planner is None:
         planner = DefaultSavePlanner()
     assert planner is not None
@@ -332,7 +304,7 @@ def _save_state_dict(
                 storage_meta=storage_meta,
                 is_coordinator=distW.is_coordinator,
             )
-        storage_writer.set_up_storage_writer(distW.is_coordinator)
+        storage_writer.set_up_storage_writer(distW.is_coordinator, distW.rank)
 
         local_plan = planner.create_local_plan()
         local_plan = storage_writer.prepare_local_plan(local_plan)
@@ -347,7 +319,13 @@ def _save_state_dict(
         all_local_plans = storage_writer.prepare_global_plan(all_local_plans)
         return all_local_plans
 
-    central_plan: SavePlan = distW.reduce_scatter("plan", local_step, global_step)
+    if use_rank_coordination:
+        central_plan: SavePlan = distW.reduce_scatter("plan", local_step, global_step)
+    else:
+        local_plan: SavePlan = local_step()
+        global_plan: SavePlan = global_step([local_plan])
+        central_plan: SavePlan = global_plan[0]
+        torch.distributed.barrier()
 
     @_dcp_method_logger(**ckpt_kwargs)
     def write_data():
@@ -364,4 +342,12 @@ def _save_state_dict(
         storage_writer.finish(metadata=global_metadata, results=all_results)
         return global_metadata
 
-    return distW.all_reduce("write", write_data, finish_checkpoint)
+    if use_rank_coordination:
+        return distW.all_reduce("write", write_data, finish_checkpoint)
+
+    write_results: list[WriteResult] = write_data()
+    metadata = finish_checkpoint([write_results])
+    torch.distributed.barrier()   
+
+    return metadata
+

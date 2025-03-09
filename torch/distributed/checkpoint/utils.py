@@ -7,6 +7,7 @@ import os
 import warnings
 from collections.abc import Sequence
 from contextlib import contextmanager
+from enum import Enum
 from functools import wraps
 from pstats import Stats
 from typing import Any, Callable, cast, Optional, TypeVar, Union
@@ -30,9 +31,33 @@ __all__ = ["find_tensor_shard", "find_state_dict_object"]
 T = TypeVar("T")
 R = TypeVar("R")
 
+class DistributedCheckpointingType(Enum):
+    SINGLE_RANK_CHECKPOINTING = 1
+    NO_COORDINATION_CHECKPOINTING = 2
+    DISTRIBUTED_CHECKPOINTING = 3
+
+def _get_distributed_checkpointing_type(
+    no_dist: bool,
+) -> DistributedCheckpointingType:
+        distributed_checkpointing_type: DistributedCheckpointingType = DistributedCheckpointingType.DISTRIBUTED_CHECKPOINTING
+
+        if no_dist:
+            if dist.is_available() and dist.is_initialized():
+                warnings.warn(
+                    f"torch.distributed is available or initialized but no-dist={no_dist}, "
+                    "assuming the intent is to save the checkpoint local to each rank without any rank coordination."
+                )
+                distributed_checkpointing_type = DistributedCheckpointingType.NO_COORDINATION_CHECKPOINTING
+            else:
+                warnings.warn(
+                    f"torch.distributed is unavailable or uninitialized but no-dist={no_dist}, "
+                    "assuming the intent is to save the checkpoint on a single rank."
+                )
+                distributed_checkpointing_type = DistributedCheckpointingType.SINGLE_RANK_CHECKPOINTING
+        return distributed_checkpointing_type
 
 def _get_failure_dict(
-    results: list[Union[T, WRAPPED_EXCEPTION]],
+    results: list[Union[T, WRAPPED_EXCEPTION]]
 ) -> dict[int, WRAPPED_EXCEPTION]:
     return cast(
         dict[int, WRAPPED_EXCEPTION],
@@ -92,15 +117,9 @@ class _DistWrapper:
         self.use_dist = use_dist
         self.coordinator_rank = coordinator_rank
         if self.use_dist:
-            self.global_coordinator_rank = (
-                dist.get_global_rank(group, coordinator_rank)
-                if group is not None
-                else coordinator_rank
-            )
             self.rank = dist.get_rank(group)
             self.is_coordinator = self.rank == coordinator_rank
         else:
-            self.global_coordinator_rank = 0
             self.rank = 0
             self.is_coordinator = True
 
@@ -135,7 +154,7 @@ class _DistWrapper:
             dist.gather_object(
                 obj=object,
                 object_gather_list=gather_objs if self.is_coordinator else None,
-                dst=self.global_coordinator_rank,
+                dst=self.coordinator_rank,
                 group=self.group,
             )
             result = gather_objs
@@ -162,7 +181,7 @@ class _DistWrapper:
             dist.scatter_object_list(
                 scatter_object_output_list=gather_result,
                 scatter_object_input_list=object_list if self.is_coordinator else None,
-                src=self.global_coordinator_rank,
+                src=self.coordinator_rank,
                 group=self.group,
             )
 
@@ -465,3 +484,4 @@ def _api_bc_check(func):
             return func(*args, **kwargs)
 
     return inner_func
+
