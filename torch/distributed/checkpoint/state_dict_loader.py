@@ -214,9 +214,11 @@ def _load_state_dict(
     @_dcp_method_logger(**ckpt_kwargs)
     def local_step():
         assert planner is not None
-        metadata = storage_reader.read_metadata(rank=distW.rank)
+        rank = distW.rank if use_rank_coordination else torch.distributed.get_rank()
+        metadata = storage_reader.read_metadata(rank=rank)
+
         planner.set_up_planner(state_dict, metadata, distW.is_coordinator)
-        storage_reader.set_up_storage_reader(metadata, distW.is_coordinator, rank=distW.rank)
+        storage_reader.set_up_storage_reader(metadata, distW.is_coordinator, rank=rank)
 
         local_plan = planner.create_local_plan()
         local_plan = storage_reader.prepare_local_plan(local_plan)

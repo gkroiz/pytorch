@@ -304,7 +304,7 @@ def _save_state_dict(
                 storage_meta=storage_meta,
                 is_coordinator=distW.is_coordinator,
             )
-        storage_writer.set_up_storage_writer(distW.is_coordinator, distW.rank)
+        storage_writer.set_up_storage_writer(distW.is_coordinator, distW.rank if use_rank_coordination else torch.distributed.get_rank())
 
         local_plan = planner.create_local_plan()
         local_plan = storage_writer.prepare_local_plan(local_plan)

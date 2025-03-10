@@ -591,10 +591,13 @@ class _FileSystemWriter(StorageWriter):
         return plan
 
     def prepare_global_plan(self, plans: list[SavePlan]) -> list[SavePlan]:
-        new_plans = [
-            dataclasses.replace(plan, storage_data=_StoragePrefix(f"__{i}_"))
-            for i, plan in enumerate(plans)
-        ]
+        if len(plans) == 1:
+            new_plans = [dataclasses.replace(plans[0], storage_data=_StoragePrefix(f"__{torch.distributed.get_rank()}_"))]
+        else:
+            new_plans = [
+                dataclasses.replace(plan, storage_data=_StoragePrefix(f"__{i}_"))
+                for i, plan in enumerate(plans)
+            ]
         return new_plans
 
     def write_data(
@@ -673,7 +676,6 @@ class _FileSystemWriter(StorageWriter):
         metadata.storage_data = storage_md
 
         metadata.storage_meta = self.storage_meta()
-
         tmp_path = cast(Path, self.fs.concat_path(self.path, f"{_metadata_fn}.tmp"))
         with self.fs.create_stream(tmp_path, "wb") as metadata_file:
             pickle.dump(metadata, metadata_file)
@@ -695,13 +697,6 @@ class _FileSystemWriter(StorageWriter):
     @property
     def metadata_path(self) -> Union[str, os.PathLike]:
         return cast(Path, self.fs.concat_path(self.path, _metadata_fn))
-
-    @property
-    def checkpoint_id(self) -> Union[str, os.PathLike]:
-        """
-        return the checkpoint_id that will be used to save the checkpoint.
-        """
-        return self.path
 
     @classmethod
     def validate_checkpoint_id(cls, checkpoint_id: Union[str, os.PathLike]) -> bool:
@@ -756,9 +751,6 @@ class FileSystemReader(StorageReader):
         self.storage_data = {}
         self.checkpoint_id = checkpoint_id
 
-        if self.checkpoint_id:
-            path = f"{self.checkpoint_id}/{self.rank}"
-            self.path = self.fs.init_path(path)
         self.load_id = _generate_uuid()
 
     def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
@@ -821,8 +813,8 @@ class FileSystemReader(StorageReader):
         return fut
 
     # Implementing the abstract function in StorageReader
-    def read_metadata(self) -> Metadata:
-        path = self.fs.concat_path(self.path, ".metadata")
+    def read_metadata(self, rank: Optional[int] = None) -> Metadata:
+        path = self.fs.concat_path(self.path, f"{rank}/.metadata")
         with self.fs.create_stream(path, "rb") as metadata_file:
             metadata = pickle.load(metadata_file)
 
@@ -832,7 +824,13 @@ class FileSystemReader(StorageReader):
 
         return metadata
 
-    def set_up_storage_reader(self, metadata: Metadata, is_coordinator: bool) -> None:
+    def set_up_storage_reader(self, metadata: Metadata, is_coordinator: bool, rank: Optional[int] = None) -> None:
+        self.rank = rank
+
+        if self.checkpoint_id:
+            path = f"{self.checkpoint_id}/{self.rank}"
+            self.path = self.fs.init_path(path)
+
         self.storage_data = metadata.storage_data
         assert self.storage_data is not None
 
@@ -841,13 +839,6 @@ class FileSystemReader(StorageReader):
 
     def prepare_global_plan(self, plans: list[LoadPlan]) -> list[LoadPlan]:
         return plans
-
-    @property
-    def checkpoint_id(self) -> Union[str, os.PathLike]:
-        """
-        return the checkpoint_id that will be used to load the checkpoint.
-        """
-        return self.path
 
     @classmethod
     def validate_checkpoint_id(cls, checkpoint_id: Union[str, os.PathLike]) -> bool:
